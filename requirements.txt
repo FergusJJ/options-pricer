@@ -1,3 +1,5 @@
 scipy
 numpy
 yfinance
+textual
+textual-dev

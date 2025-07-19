@@ -1,69 +1,137 @@
-import yfinance as yf
-from pprint import pprint
+from textual.app import App, ComposeResult
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.widgets import Header, Footer, Input, Button, DataTable, Static, Label
+from textual.reactive import reactive
+from textual import on
+import pandas as pd
 
-from pkg import bsm, get_risk_free_rate, diff_date
+from pkg.ui import ui_button
+from pkg.util import get_option_dates, get_option_chain, bsm_option_price
 
-ANNUAL_MARKET_OPEN_DAYS = 252
+
+class BSMDisplay(Vertical):
+    def compose(self) -> ComposeResult:
+        with Horizontal(id="input-row"):
+            yield Label("Ticker:")
+            yield Input(value="AAPL", placeholder="AAPL", id="ticker")
+            yield ui_button.ToggleButton(id="toggle_direction")
 
 
-def bsm_option_price(ticker: str, option_type: str):
-    if option_type != "call" and option_type != "put":
-        raise ValueError
-    symbol = yf.Ticker(ticker)
-    last_price = symbol.fast_info["last_price"]
+class OptionsApp(App):
+    CSS_PATH = "styles.css"
 
-    options_expiries = symbol.options
-    option_expiry_date = options_expiries[len(options_expiries) - 1]
-    years_to_expire = diff_date(option_expiry_date) / ANNUAL_MARKET_OPEN_DAYS
+    ticker_value = reactive("")
+    date_value = reactive("")
+    option_selected = reactive(False)
 
-    risk_percentage = get_risk_free_rate()
+    def __init__(self, **kwargs):
+        self.df: pd.DataFrame | None = None
+        self.option_chain: pd.DataFrame | None = None
+        super().__init__(**kwargs)
 
-    option_chain = symbol.option_chain(option_expiry_date)
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Footer()
+        with VerticalScroll():
+            yield BSMDisplay()
+            yield DataTable(
+                zebra_stripes=True,
+                cursor_type="row",
+                id="results_table",
+                show_header=True,
+            )
+            yield ui_button.DynamicButton(id="dynamic_fetch", disabled=True)
+            yield Static("", id="calculated_value")
 
-    options = None
-    if option_type == "call":
-        options = option_chain.calls.dropna()
-    else:
-        options = option_chain.puts.dropna()
+    @on(Input.Changed)
+    def on_ticker_changed(self, event: Input.Changed):
+        self.ticker_value = event.value.strip()
+        button = self.query_one("#dynamic_fetch", ui_button.DynamicButton)
+        button.update_disabled_state(
+            self.ticker_value, self.date_value, self.option_selected
+        )
 
-    in_the_money = options[options["inTheMoney"]]
-    out_of_the_money = options[~options["inTheMoney"]]
+    @on(Button.Pressed, "#dynamic_fetch")
+    def on_dynamic_button_pressed(self):
+        button = self.query_one("#dynamic_fetch", ui_button.DynamicButton)
+        if (button.state - 1) % 3 == button.states.FETCH_DATES:
+            """Fetch dates, update state of button and then diable it until selection"""
+            df = get_option_dates(self.ticker_value)
+            self.update_table(df)
+            button.update_disabled_state(
+                self.ticker_value, self.date_value, self.option_selected
+            )
+        elif (button.state - 1) % 3 == button.states.FETCH_OPTION_CHAIN:
+            """Fetch option chain, overwirte the dates table, reset the selected value"""
+            self.update_table(self.option_chain)
+            button.update_disabled_state(
+                self.ticker_value, self.date_value, self.option_selected
+            )
+        elif (button.state - 1) % 3 == button.states.RESET:
+            self.reset_state()
+        else:
+            raise Exception("This shouldn't happen")
 
-    selected_option_itm = in_the_money.iloc[0]
-    strike_price_itm = selected_option_itm.loc["strike"]
-    volatility_itm = selected_option_itm.loc["impliedVolatility"]
+    def update_table(self, df: pd.DataFrame) -> None:
+        table = self.query_one("#results_table", DataTable)
+        table.clear(columns=True)
+        for col in df.columns:
+            table.add_column(col, key=col)
+        for idx, row in df.iterrows():
+            table.add_row(*[str(val) for val in row.values], key=str(idx))
+        self.df = df
 
-    selected_option_ootm = out_of_the_money.iloc[0]
-    strike_price_ootm = selected_option_ootm.loc["strike"]
-    volatility_ootm = selected_option_ootm.loc["impliedVolatility"]
+    @on(DataTable.RowSelected)
+    def on_row_selected(self, event: DataTable.RowSelected) -> None:
+        """Handle row selection in the DataTable"""
+        button = self.query_one("#dynamic_fetch", ui_button.DynamicButton)
+        if event.row_key is None:
+            return
+        if button.state == button.states.FETCH_DATES:
+            return
+        direction_button = self.query_one("#toggle_direction", ui_button.ToggleButton)
+        row_index = int(event.row_key.value)
+        if button.state == button.states.FETCH_OPTION_CHAIN:
+            self.date_value = self.df.iloc[row_index]["Expiration Date"]
+            df = get_option_chain(
+                ticker=self.ticker_value,
+                date=self.date_value,
+                direction=direction_button.get_direction(),
+            )
+            self.option_chain = df
+        elif button.state == button.states.RESET:
+            option = self.df.iloc[row_index]
+            val = bsm_option_price(
+                self.ticker_value,
+                self.date_value,
+                direction=direction_button.get_direction(),
+                selected_option=option,
+            )
+            self.option_selected = True
+            self.update_bsm_value(val)
+        else:
+            raise Exception("(on_row_selected) Should not happen!!")
+        button.update_disabled_state(
+            self.ticker_value, self.date_value, self.option_selected
+        )
 
-    option_price_itm_bsm = bsm(
-        option_type=option_type,
-        K=strike_price_itm,
-        s=last_price,
-        t=years_to_expire,
-        r=risk_percentage,
-        sigma=volatility_itm,
-    )
+    def update_bsm_value(self, calculated_price: float):
+        self.query_one("#calculated_value", Static).update(
+            f"BSM Price: ${calculated_price:.2f}"
+        )
 
-    option_price_ootm_bsm = bsm(
-        option_type=option_type,
-        K=strike_price_ootm,
-        s=last_price,
-        t=years_to_expire,
-        r=risk_percentage,
-        sigma=volatility_ootm,
-    )
-
-    print(f"In the money option: {selected_option_itm.loc['lastPrice']}")
-    print(f"option price bsm: {option_price_itm_bsm}\n\n")
-
-    print(f"Out of the money option: {selected_option_ootm.loc['lastPrice']}")
-    print(f"option price bsm: {option_price_ootm_bsm}\n\n")
+    def reset_state(self):
+        self.date_value = ""
+        self.option_selected = False
+        self.df = None
+        self.option_chain = None
+        self.query_one("#results_table", DataTable).clear(columns=True)
+        self.query_one("#calculated_value", Static).update("")
+        self.query_one("#dynamic_fetch", ui_button.DynamicButton).update_disabled_state(
+            self.ticker_value, self.date_value, self.option_selected
+        )
 
 
 if __name__ == "__main__":
-    print("CALLS:")
-    bsm_option_price("TSLA", "call")
-    print("PUTS:")
-    bsm_option_price("TSLA", "put")
+    app = OptionsApp()
+    app.run()
