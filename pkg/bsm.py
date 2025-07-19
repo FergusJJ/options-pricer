@@ -20,7 +20,7 @@ def bsm(
 ) -> float:
     """
     option_type: str
-        'call' or 'put'
+        'CALL' or 'PUT'
     K: float
         strike price of the option
     s: float
@@ -36,14 +36,14 @@ def bsm(
     d1 = calc_d1(s, K, r, t, sigma)
     d2 = d1 - sigma * np.sqrt(t)
 
-    if option_type == "put":
+    if option_type == "PUT":
         neg_norm_d1 = norm.cdf(-d1)
         neg_norm_d2 = norm.cdf(-d2)
         strike_term = K * np.exp(-r * t)
         put_price = (strike_term * neg_norm_d2) - (s * neg_norm_d1)
         return put_price
 
-    if option_type == "call":
+    if option_type == "CALL":
         norm_d1 = norm.cdf(d1)
         norm_d2 = norm.cdf(d2)
         strike_term = K * np.exp(-r * t)
